@@ -246,7 +246,7 @@ fix_deps() {
 
   for f in "$dir"/*(.)
   do
-    sed -i='' "s#_____deps_____#$relative#g" "$f"
+    sed -i'' "s#_____deps_____#$relative#g" "$f"
   done
 
   for d in "$dir"/*(/)
