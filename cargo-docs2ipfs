@@ -1,0 +1,266 @@
+#!/usr/bin/env zsh
+
+# This requires some utilities you should get from your package manager:
+#
+#  - `jq`
+#  - `ipfs` (and a running daemon)
+#
+# And some from crates.io:
+#
+#  - `cargo install cargo-download`
+
+set -euo pipefail
+
+if [[ $1 = 'docs2ipfs' ]]
+then
+  shift
+fi
+
+export crate=${1:?crate}
+export version=${2:?version}
+
+log() {
+  echo "$@" >&2
+}
+
+debug() {
+  if test ${DEBUG:-0} -eq 1
+  then
+    log "$@"
+  fi
+}
+
+run() {
+  if test ${DEBUG:-0} -eq 1
+  then
+    debug "$@"
+    "$@" | tee /dev/stderr
+  else
+    "$@" 2>/dev/null
+  fi
+}
+
+# Track the root crate we're publishing, then recurse to actually build it
+if ! test -v root
+then
+  export root=$crate-$version
+  export chain=''
+
+  export cache="${XDG_CACHE_HOME:-$HOME/.cache}/cargo-docs2ipfs/cache"
+  mkdir -p "${XDG_RUNTIME_DIR:-/tmp}/cargo-docs2ipfs"
+  export tmp="$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/cargo-docs2ipfs/tmp.XXXXXX")"
+
+  export hashes="$cache/hashes"
+  export crates="$cache/crates"
+  export seen="$tmp/seen"
+
+  # rm -rf "$hashes" # TODO: Disable cross-run caching for dev
+  mkdir -p "$hashes"
+  mkdir -p "$crates"
+  touch "$seen"
+
+  log "Starting doc build for $crate-$version and dependencies"
+
+  hash="$("$0" $crate $version)"
+
+  run ipfs pin add "$hash"
+  echo "
+    $crate-$version docs published to $hash
+  "
+
+  exit 0
+fi
+
+export chain=${chain}:$crate-$version
+
+trap '
+  if test $? -ne 0
+  then
+    log "Failed during $chain"
+  fi
+' EXIT
+
+# If we've already built this crate, return the cached hash
+if test -e "$hashes/$crate-$version.index"
+then
+  cat "$hashes/$crate-$version.index"
+  exit 0
+fi
+
+# If we've already visited this crate this run, and it was _not_ cached, we have
+# a loop
+if grep -Fxq $crate-$version "$seen"
+then
+  log "Loop detected at $chain"
+  exit 1
+fi
+echo $crate-$version >> "$seen"
+
+log "Building docs for $crate-$version"
+debug "Current chain $chain"
+
+# Check if we've already downloaded this crate to the cache
+if ! test -e "$crates/$crate-$version.tar.gz"
+then
+  log "Downloading $crate-$version"
+  run cargo download -o "$crates/$crate-$version.tar.gz" $crate==$version
+fi
+
+# Extract sources so we can find all the dependencies
+tar xzf "$crates/$crate-$version.tar.gz" -C "$tmp"
+
+# Check metadata to customise build like docs.rs does
+is_proc_macro=$(
+  cargo metadata \
+    --all-features \
+    --format-version 1 \
+    --manifest-path "$tmp/$crate-$version/Cargo.toml" \
+    2>/dev/null \
+    | jq -r '
+      . as $root
+      | .packages[]
+      | select(.id == $root.resolve.root)
+      | .targets
+      | any(
+        .kind | any(. == "proc-macro")
+      )
+    '
+)
+
+docsrs_metadata="$(
+  cargo metadata \
+  --format-version=1 \
+  --manifest-path "$tmp/$crate-$version/Cargo.toml" \
+  | jq '
+    . as $data
+    | .resolve.root as $root
+    | .packages[]
+    | select(.id == $root)
+    | .metadata.docs.rs
+  '
+)"
+
+docsrs_val() {
+  echo "$docsrs_metadata" | jq -r "$1"
+}
+
+cargo_args=(--locked)
+env_args=()
+rustdoc_args=(-Z unstable-options)
+
+if [[ "$(docsrs_val '.["all-features"]')" = "true" ]]
+then
+  cargo_args+="--all-features"
+fi
+
+if [[ "$(docsrs_val '.["no-default-features"]')" = "true" ]]
+then
+  cargo_args+="--no-default-features"
+fi
+
+if [[ "$(docsrs_val '.features')" != "null" ]]
+then
+  cargo_args+="--features=$(docsrs_val '.features | join(",")')"
+fi
+
+# proc-macros don't obey `--target`
+# https://github.com/rust-lang/cargo/issues/7677
+if [[ "$is_proc_macro" != "true" ]]
+then
+  if [[ "$(docsrs_val '.["default-target"]')" != "null" ]]
+  then
+    default_target=$(docsrs_val '.["default-target"]')
+    cargo_args+="--target=$default_target"
+  fi
+
+  if [[ "$(docsrs_val '.["default-target"]')" = "null" && "$(docsrs_val '.targets[0]')" != "null" ]]
+  then
+    default_target=$(docsrs_val '.targets[0]')
+    cargo_args+="--target=$default_target"
+  fi
+fi
+
+if [[ "$(docsrs_val '.["rustc-args"]')" != "null" ]]
+then
+  env_args+="RUSTCFLAGS=${RUSTCFLAGS-} $(docsrs_val '.["rustc-args"] | join(" ")')"
+fi
+
+docsrs_val '.["rustdoc-args"] // empty | .[]' | while read -r arg
+do
+  rustdoc_args+="$arg"
+done
+
+# This is an empty dir dag node where we will collect links to the dependencies
+# docs
+deps=QmUNLLsPACCz1vLxQVkXqqLX5R1X345qqfHbsf67hvA3Nn
+
+# Recurse to dependencies of non-proc-macro crates (proc-macros dependencies
+# should not be visible in their docs ???)
+if [[ "$is_proc_macro" != "true" ]]
+then
+  while IFS='|' read -r subcrate lib package subversion
+  do
+    if ! test $crate-$version = $subcrate-$subversion; then
+      subhash=$("$0" $subcrate $subversion) || continue
+      deps=$(ipfs object patch add-link $deps $package $subhash)
+      rustdoc_args+="--extern-html-root-url=$lib=_____deps_____/$package"
+    fi
+  done < <(set -e; cargo metadata \
+        --format-version 1 \
+        --manifest-path "$tmp/$crate-$version/Cargo.toml" \
+        "${cargo_args[@]}" \
+        2>/dev/null \
+        | jq -r '
+          . as $root
+          | (.packages[] | select(.id == $root.resolve.root)) as $pkg
+          | .resolve.nodes[]
+          | select(.id == $root.resolve.root)
+          | .deps[]
+          | select(.dep_kinds | any(.kind == null))
+          | .pkg as $depid
+          | ($root.packages[] | select(.id == $depid)) as $subpkg
+          | ($pkg.dependencies[] | select(.name == $subpkg.name)) as $dep
+          | (
+              $subpkg.targets[]
+              | select(.kind | any(. == "lib" or . == "proc-macro"))
+            ) as $lib
+          | {
+            name: $subpkg.name,
+            lib: ($lib.name | gsub("-"; "_")),
+            rename: ($dep.rename // $dep.name),
+            version: $subpkg.version
+          }
+          | "\(.name)|\(.lib)|\(.rename)|\(.version)"
+        ')
+fi
+
+# build docs
+run env "${env_args[@]}" cargo rubber --manifest-path="$tmp/$crate-$version/Cargo.toml" rustdoc --lib "${cargo_args[@]}" -- "${rustdoc_args[@]}"
+
+# Fix _____deps_____ to be a relative link to the .deps folder we will attach later
+fix_deps() {
+  setopt nullglob
+
+  dir=$1
+  relative=$2
+
+  for f in "$dir"/*(.)
+  do
+    sed -i='' "s#_____deps_____#$relative#g" "$f"
+  done
+
+  for d in "$dir"/*(/)
+  do
+    fix_deps "$d" "../$relative"
+  done
+}
+
+run fix_deps "$tmp/$crate-$version/target/${default_target:-}/doc" ".deps"
+
+# Publish docs file to ipfs
+docs_hash=$(run ipfs add --pin=false -rpQ "$tmp/$crate-$version/target/${default_target:-}/doc")
+
+hash=$(ipfs object patch add-link $docs_hash .deps $deps)
+
+log "$crate-$version is $hash"
+echo "$hash" | tee "$hashes/$crate-$version.index"
