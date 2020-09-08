@@ -49,6 +49,7 @@ then
   export cache="${XDG_CACHE_HOME:-$HOME/.cache}/cargo-docs2ipfs/cache"
   mkdir -p "${XDG_RUNTIME_DIR:-/tmp}/cargo-docs2ipfs"
   export tmp="$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/cargo-docs2ipfs/tmp.XXXXXX")"
+  export index="${XDG_DATA_HOME:-$HOME/.local/share}/cargo-docs2ipfs/index"
 
   export hashes="$cache/hashes"
   export crates="$cache/crates"
@@ -57,6 +58,7 @@ then
   # rm -rf "$hashes" # TODO: Disable cross-run caching for dev
   mkdir -p "$hashes"
   mkdir -p "$crates"
+  mkdir -p "$(dirname "$index")"
   touch "$seen"
 
   log "Starting doc build for $crate-$version and dependencies"
@@ -68,6 +70,8 @@ then
   run ipfs pin add "$hash"
   echo "
     $crate-$version docs published to $hash
+
+    Index updated to $(cat "$index")
   "
 
   exit 0
@@ -266,5 +270,31 @@ hash=$(ipfs object patch add-link $docs_hash .deps $deps)
 
 rm -r "$tmp/$crate-$version"
 
+index_hash=$(cat "$index" 2>/dev/null || echo QmUNLLsPACCz1vLxQVkXqqLX5R1X345qqfHbsf67hvA3Nn)
+
+ipfs_object_get_link() {
+  name="$2"
+  run ipfs object links $1 | while read -r link_hash link_size link_name
+  do
+    debug size $link_size
+    debug hash $link_hash
+    debug name $link_name
+    if [[ "$link_name" == "$name" ]]
+    then
+      echo $link_hash
+      exit 0
+    fi
+  done
+
+  exit 1
+}
+
+index_crate_hash=$(run ipfs_object_get_link $index_hash $crate || echo QmUNLLsPACCz1vLxQVkXqqLX5R1X345qqfHbsf67hvA3Nn )
+index_crate_hash=$(run ipfs object patch add-link $index_crate_hash $version $hash)
+index_hash=$(run ipfs object patch add-link $index_hash $crate $index_crate_hash)
+
+debug "New index hash: $index_hash"
+echo $index_hash > "$index"
+
 log "$crate-$version is $hash"
-echo "$hash" | tee "$hashes/$crate-$version.index"
+echo $hash | tee "$hashes/$crate-$version.index"
