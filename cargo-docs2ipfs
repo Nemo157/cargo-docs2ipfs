@@ -63,6 +63,8 @@ then
 
   hash="$("$0" $crate $version)"
 
+  rm -r "$tmp"
+
   run ipfs pin add "$hash"
   echo "
     $crate-$version docs published to $hash
@@ -261,6 +263,8 @@ run fix_deps "$tmp/$crate-$version/target/${default_target:-}/doc" ".deps"
 docs_hash=$(run ipfs add --pin=false -rpQ "$tmp/$crate-$version/target/${default_target:-}/doc")
 
 hash=$(ipfs object patch add-link $docs_hash .deps $deps)
+
+rm -r "$tmp/$crate-$version"
 
 log "$crate-$version is $hash"
 echo "$hash" | tee "$hashes/$crate-$version.index"
